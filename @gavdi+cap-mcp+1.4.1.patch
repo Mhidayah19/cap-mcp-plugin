@@ -1,0 +1,1848 @@
+diff --git a/node_modules/@gavdi/cap-mcp/lib/annotations/constants.js b/node_modules/@gavdi/cap-mcp/lib/annotations/constants.js
+index 3e5688f..9b5b8fa 100644
+--- a/node_modules/@gavdi/cap-mcp/lib/annotations/constants.js
++++ b/node_modules/@gavdi/cap-mcp/lib/annotations/constants.js
+@@ -22,6 +22,7 @@ exports.MCP_ANNOTATION_MAPPING = new Map([
+     ["@mcp.wrap", "wrap"],
+     ["@mcp.wrap.tools", "wrap.tools"],
+     ["@mcp.wrap.modes", "wrap.modes"],
++    ["@mcp.wrap.name", "wrap.name"],
+     ["@mcp.wrap.hint", "wrap.hint"],
+     ["@mcp.wrap.hint.get", "wrap.hint.get"],
+     ["@mcp.wrap.hint.query", "wrap.hint.query"],
+diff --git a/node_modules/@gavdi/cap-mcp/lib/auth/factory.js b/node_modules/@gavdi/cap-mcp/lib/auth/factory.js
+index 7e83c90..5713e55 100644
+--- a/node_modules/@gavdi/cap-mcp/lib/auth/factory.js
++++ b/node_modules/@gavdi/cap-mcp/lib/auth/factory.js
+@@ -1,132 +1,322 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
++exports.set401WithWwwAuthenticate = set401WithWwwAuthenticate;
+ exports.authHandlerFactory = authHandlerFactory;
+ exports.errorHandlerFactory = errorHandlerFactory;
+ const xsuaa_service_1 = require("./xsuaa-service");
+ const utils_1 = require("./utils");
+ const logger_1 = require("../logger");
+-/** JSON-RPC 2.0 error code for unauthorized requests */
++
+ const RPC_UNAUTHORIZED = 10;
++const MCP_SESSION_HEADER = "x-mcp-session-id";
++
+ /* @ts-ignore */
+-const cds = global.cds || require("@sap/cds"); // This is a work around for missing cds context
+-/**
+- * Creates an Express middleware for MCP authentication validation.
+- *
+- * This handler validates that requests are properly authenticated based on the CAP authentication
+- * configuration. It checks for authorization headers (except for 'dummy' auth), validates the
+- * CAP context, and ensures a valid user is present.
+- *
+- * The middleware performs the following validations:
+- * 1. Checks for Authorization header (unless CAP auth is 'dummy')
+- * 2. Validates that CAP context is properly initialized
+- * 3. Ensures an authenticated user exists and is not anonymous
+- *
+- * @returns Express RequestHandler middleware function
+- *
+- * @example
+- * ```typescript
+- * const authMiddleware = authHandlerFactory();
+- * app.use('/mcp', authMiddleware);
+- * ```
+- *
+- * @throws {401} When authorization header is missing (non-dummy auth)
+- * @throws {401} When user is not authenticated or is anonymous
+- * @throws {500} When CAP context is not properly loaded
+- */
++const cds = global.cds || require("@sap/cds");
++
++// ============================================================================
++// RFC 9728 Compliant 401 Response
++// ============================================================================
++
++function set401WithWwwAuthenticate(req, res, message) {
++    const baseUrl = `${utils_1.getProtocol(req)}://${utils_1.getEffectiveHost(req)}`;
++    const resourceMetadataUrl = `${baseUrl}/.well-known/oauth-protected-resource`;
++
++    res.setHeader('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadataUrl}"`);
++    logger_1.LOGGER.debug("[MCP-AUTH] Returning 401 with WWW-Authenticate header", { 
++        resourceMetadataUrl,
++        message 
++    });
++
++    res.status(401).json({
++        jsonrpc: "2.0",
++        error: { code: RPC_UNAUTHORIZED, message, id: null },
++    });
++}
++
++// ============================================================================
++// CAP User Creation from Security Context
++// ============================================================================
++
++function createCapUserFromSecurityContext(securityContext) {
++    logger_1.LOGGER.debug("[MCP-AUTH] Creating CAP user from security context");
++
++    const userId = securityContext.getLogonName?.() || securityContext.getEmail?.() || 'unknown';
++    const attrs = securityContext.getAdditionalAuthzAttributes?.() || {};
++    const scopes = securityContext.getScopes?.() || [];
++
++    logger_1.LOGGER.debug("[MCP-AUTH] Extracted user info from security context", {
++        userId,
++        attributeCount: Object.keys(attrs).length,
++        scopeCount: scopes.length,
++        scopes: scopes.slice(0, 5) // Log first 5 scopes for debugging
++    });
++
++    // Map XSUAA scopes to CAP roles (e.g., "app!t123.Admin" -> "Admin")
++    const roles = scopes.reduce((acc, scope) => {
++        const parts = scope.split('.');
++        const role = parts.length > 1 ? parts[parts.length - 1] : scope;
++        acc[role] = true;
++        return acc;
++    }, {});
++
++    const user = new cds.User({ id: userId, attr: attrs, _roles: roles });
++
++    // CRITICAL: Attach authInfo for downstream services (destination resolution, token propagation)
++    user.authInfo = securityContext;
++
++    logger_1.LOGGER.info("[MCP-AUTH] CAP user created successfully", {
++        userId: user.id,
++        roles: Object.keys(roles),
++        hasAuthInfo: !!user.authInfo
++    });
++
++    return user;
++}
++
++function resolveTenantId(req, securityContext) {
++    logger_1.LOGGER.debug("[MCP-TENANT] Starting tenant resolution from security context");
++
++    // Attempt 1: Extract from token payload (most reliable for multi-tenant)
++    const tokenInfo = securityContext.getTokenInfo?.();
++    const payload = tokenInfo?.getPayload?.() || tokenInfo?.payload;
++    
++    logger_1.LOGGER.debug("[MCP-TENANT] Token info inspection", {
++        hasTokenInfo: !!tokenInfo,
++        hasPayload: !!payload,
++        payloadZid: payload?.zid,
++        payloadZoneId: payload?.zone_id,
++        payloadTenantId: payload?.tenantid,
++        payloadExtAttr: payload?.ext_attr ? {
++            zdn: payload.ext_attr.zdn,
++            serviceinstanceid: payload.ext_attr.serviceinstanceid
++        } : null
++    });
++
++    const zidFromContext = securityContext.getZoneId?.();
++    const zid = zidFromContext || payload?.zid || payload?.zone_id || payload?.tenantid;
++    
++    if (zid) {
++        logger_1.LOGGER.info("[MCP-TENANT] Tenant resolved from JWT token", {
++            tenant: zid,
++            source: zidFromContext ? "securityContext.getZoneId()" : "token.payload",
++            zdn: payload?.ext_attr?.zdn || "N/A"
++        });
++        return { tenant: zid, source: "token" };
++    }
++
++    // Attempt 2: Extract from request headers (fallback for edge cases)
++    const tenantHeader = req?.headers?.tenantid ||
++        req?.headers?.["x-sap-tenantid"] ||
++        req?.headers?.["x-sap-tenant-id"];
++    
++    logger_1.LOGGER.debug("[MCP-TENANT] Checking request headers for tenant", {
++        tenantidHeader: req?.headers?.tenantid || null,
++        xSapTenantIdHeader: req?.headers?.["x-sap-tenantid"] || null,
++        xSapTenantIdDashHeader: req?.headers?.["x-sap-tenant-id"] || null
++    });
++
++    if (typeof tenantHeader === "string" && tenantHeader.length > 0) {
++        const tenant = tenantHeader.includes("!") ? tenantHeader.split("!")[0] : tenantHeader;
++        logger_1.LOGGER.info("[MCP-TENANT] Tenant resolved from request header", {
++            tenant,
++            rawHeader: tenantHeader,
++            source: "header"
++        });
++        return { tenant, source: "header" };
++    }
++
++    // Attempt 3: Extract from identity zone (last resort)
++    const identityZone = securityContext.getIdentityZone?.();
++    
++    if (identityZone) {
++        logger_1.LOGGER.warn("[MCP-TENANT] Tenant resolved from identity zone (may be provider tenant)", {
++            tenant: identityZone,
++            source: "identityZone",
++            warning: "This may indicate provider context instead of subscriber"
++        });
++        return { tenant: identityZone, source: "identityZone" };
++    }
++
++    // No tenant found - this is a problem for multi-tenant apps
++    logger_1.LOGGER.error("[MCP-TENANT] FAILED to resolve tenant ID - destination lookups may fail", {
++        hasTokenInfo: !!tokenInfo,
++        hasPayload: !!payload,
++        hasHeaders: !!req?.headers,
++        recommendation: "Ensure JWT contains zid claim or headers include x-sap-tenantid"
++    });
++    
++    return { tenant: undefined, source: "none" };
++}
++
++function ensureCapContextUser(req, securityContext) {
++    logger_1.LOGGER.debug("[MCP-AUTH] Ensuring CAP context has authenticated user");
++
++    const existingUser = cds.context?.user;
++    const existingTenant = cds.context?.tenant;
++    const useExisting = existingUser && existingUser !== cds.User.anonymous;
++
++    logger_1.LOGGER.debug("[MCP-AUTH] Current CAP context state", {
++        hasContext: !!cds.context,
++        hasExistingUser: !!existingUser,
++        existingUserId: existingUser?.id || null,
++        existingTenant: existingTenant || null,
++        isAnonymous: existingUser === cds.User.anonymous,
++        willReuseExisting: useExisting
++    });
++
++    const user = useExisting ? existingUser : createCapUserFromSecurityContext(securityContext);
++    
++    if (!user.authInfo) {
++        logger_1.LOGGER.debug("[MCP-AUTH] Attaching authInfo to user (was missing)");
++        user.authInfo = securityContext;
++    }
++
++    const { tenant, source } = resolveTenantId(req, securityContext);
++
++    if (!cds.context) {
++        logger_1.LOGGER.debug("[MCP-AUTH] Creating new CAP context");
++        cds.context = { user };
++    } else {
++        cds.context.user = user;
++    }
++
++    if (tenant && cds.context.tenant !== tenant) {
++        if (cds.context.tenant) {
++            logger_1.LOGGER.warn("[MCP-TENANT] Overriding existing CAP tenant - potential context mismatch", {
++                previousTenant: cds.context.tenant,
++                newTenant: tenant,
++                source,
++                action: "Replacing with tenant from security context"
++            });
++        }
++        cds.context.tenant = tenant;
++    }
++
++    logger_1.LOGGER.info("[MCP-AUTH] CAP context fully initialized for MCP request", {
++        userId: user.id,
++        tenant: cds.context.tenant,
++        tenantSource: source,
++        roles: Object.keys(user._roles || {}),
++        hasAuthInfo: !!user.authInfo,
++        authInfoType: user.authInfo?.constructor?.name || "unknown"
++    });
++}
++
++// ============================================================================
++// Auth Handler Factory
++// ============================================================================
++
+ function authHandlerFactory() {
+     const authKind = cds.env.requires.auth.kind;
+     const xsuaaService = !(0, utils_1.useMockAuth)(authKind) ? new xsuaa_service_1.XSUAAService() : undefined;
+-    logger_1.LOGGER.debug("Authentication kind", authKind);
++    
++    logger_1.LOGGER.info("[MCP-AUTH] Auth handler factory initialized", { 
++        authKind,
++        xsuaaConfigured: xsuaaService?.isConfigured() || false
++    });
++
+     return async (req, res, next) => {
++        const requestId = req.headers["x-request-id"] || req.headers["x-correlation-id"] || "N/A";
++        
++        // Allow unauthenticated MCP initialize requests for OAuth discovery
++        // The MCP protocol requires that clients can discover OAuth metadata before authenticating
++        const isInitializeRequest = req.body?.method === "initialize" && !req.headers[MCP_SESSION_HEADER];
++        
++        logger_1.LOGGER.debug("[MCP-AUTH] Processing authentication for request", {
++            requestId,
++            method: req.method,
++            path: req.path,
++            hasAuthHeader: !!req.headers.authorization,
++            isInitializeRequest,
++            authKind
++        });
++
++        // Skip auth for initialize requests to allow OAuth discovery
++        if (isInitializeRequest) {
++            logger_1.LOGGER.info("[MCP-AUTH] Allowing unauthenticated initialize request for OAuth discovery", {
++                requestId,
++                reason: "MCP clients need to discover OAuth metadata before authenticating"
++            });
++            return next();
++        }
++
++        // Check authorization header
+         if (!req.headers.authorization && authKind !== "dummy") {
+-            res.status(401).json({
+-                jsonrpc: "2.0",
+-                error: {
+-                    code: RPC_UNAUTHORIZED,
+-                    message: "Unauthorized",
+-                    id: null,
+-                },
++            logger_1.LOGGER.warn("[MCP-AUTH] Request rejected - missing authorization header", {
++                requestId,
++                path: req.path,
++                authKind
+             });
+-            return;
++            return set401WithWwwAuthenticate(req, res, "Unauthorized: Missing authorization header");
+         }
+-        // For XSUAA/JWT auth types, use @sap/xssec for validation
+-        if ((authKind === "jwt" || authKind === "xsuaa" || authKind === "ias") &&
+-            xsuaaService?.isConfigured()) {
++
++        // XSUAA/JWT/IAS validation
++        if ((authKind === "jwt" || authKind === "xsuaa" || authKind === "ias") && xsuaaService?.isConfigured()) {
++            logger_1.LOGGER.debug("[MCP-AUTH] Validating JWT token via XSUAA service", { requestId });
++            
+             const securityContext = await xsuaaService.createSecurityContext(req);
+             if (!securityContext) {
+-                res.status(401).json({
+-                    jsonrpc: "2.0",
+-                    error: {
+-                        code: RPC_UNAUTHORIZED,
+-                        message: "Invalid or expired token",
+-                        id: null,
+-                    },
++                logger_1.LOGGER.warn("[MCP-AUTH] Security context creation failed - invalid or expired token", {
++                    requestId,
++                    path: req.path
+                 });
+-                return;
++                return set401WithWwwAuthenticate(req, res, "Unauthorized: Invalid or expired token");
+             }
+-            // Add security context to request for later use
++
++            logger_1.LOGGER.debug("[MCP-AUTH] Security context created successfully", { requestId });
+             req.securityContext = securityContext;
++            ensureCapContextUser(req, securityContext);
+         }
+-        // Continue with existing CAP context validation
++
++        // CAP context validation
+         const ctx = cds.context;
++
+         if (!ctx) {
+-            res.status(500).json({
++            logger_1.LOGGER.error("[MCP-AUTH] CAP context is null after auth middleware - internal error", {
++                requestId,
++                path: req.path
++            });
++            return res.status(500).json({
+                 jsonrpc: "2.0",
+-                error: {
+-                    code: -32603,
+-                    message: "Internal Error: Context not correctly loaded",
+-                    id: null,
+-                },
++                error: { code: -32603, message: "Internal Error: Context not correctly loaded", id: null },
+             });
+-            return;
+         }
++
+         const user = ctx.user;
+         if (!user || user === cds.User.anonymous) {
+-            res.status(401).json({
+-                jsonrpc: "2.0",
+-                error: {
+-                    code: RPC_UNAUTHORIZED,
+-                    message: "Unauthorized",
+-                    id: null,
+-                },
++            logger_1.LOGGER.warn("[MCP-AUTH] Request rejected - user is null or anonymous", {
++                requestId,
++                hasUser: !!user,
++                isAnonymous: user === cds.User.anonymous
+             });
+-            return;
++            return set401WithWwwAuthenticate(req, res, "Unauthorized: User not authenticated");
+         }
++
++        logger_1.LOGGER.info("[MCP-AUTH] Request authenticated successfully", { 
++            requestId,
++            userId: user.id,
++            tenant: ctx.tenant,
++            path: req.path
++        });
+         return next();
+     };
+ }
+-/**
+- * Creates an Express error handling middleware for CAP authentication errors.
+- *
+- * This error handler catches authentication and authorization errors thrown by CAP
+- * middleware and converts them to JSON-RPC 2.0 compliant error responses. It handles
+- * both 401 (Unauthorized) and 403 (Forbidden) errors specifically.
+- *
+- * @returns Express ErrorRequestHandler middleware function
+- *
+- * @example
+- * ```typescript
+- * const errorHandler = errorHandlerFactory();
+- * app.use('/mcp', errorHandler);
+- * ```
+- *
+- * @param err - The error object, expected to be 401 or 403 for auth errors
+- * @param req - Express request object (unused, marked with underscore)
+- * @param res - Express response object for sending error responses
+- * @param next - Express next function for passing unhandled errors
+- */
++
++// ============================================================================
++// Error Handler Factory
++// ============================================================================
++
+ function errorHandlerFactory() {
+-    return (err, _, res, next) => {
++    return (err, req, res, next) => {
+         if (err === 401 || err === 403) {
+-            res.status(err).json({
++            logger_1.LOGGER.warn("[MCP-AUTH] Auth error caught by error handler", {
++                errorCode: err,
++                path: req?.path
++            });
++            return res.status(err).json({
+                 jsonrpc: "2.0",
+-                error: {
+-                    code: RPC_UNAUTHORIZED,
+-                    message: err === 401 ? "Unauthorized" : "Forbidden",
+-                    id: null,
+-                },
++                error: { code: RPC_UNAUTHORIZED, message: err === 401 ? "Unauthorized" : "Forbidden", id: null },
+             });
+-            return;
+         }
+         next(err);
+     };
+diff --git a/node_modules/@gavdi/cap-mcp/lib/auth/handlers.js b/node_modules/@gavdi/cap-mcp/lib/auth/handlers.js
+index 0672335..07df9e1 100644
+--- a/node_modules/@gavdi/cap-mcp/lib/auth/handlers.js
++++ b/node_modules/@gavdi/cap-mcp/lib/auth/handlers.js
+@@ -2,54 +2,348 @@
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.handleTokenRequest = handleTokenRequest;
+ const logger_1 = require("../logger");
++const utils_1 = require("./utils");
++
++/* @ts-ignore */
++const cds = global.cds || require("@sap/cds");
++
++// ============================================================================
++// Token Cache
++// Allows same authorization code to be exchanged multiple times.
++// Required because Claude.ai and mcp-remote both try to exchange the same code.
++// ============================================================================
++
++const tokenCache = new Map();
++const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
++
++// ============================================================================
++// JWT Decoding (for logging only, no verification)
++// ============================================================================
++
++function decodeJwtPayload(token) {
++    try {
++        const parts = token.split('.');
++        if (parts.length !== 3) return null;
++        return JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
++    } catch (e) {
++        return null;
++    }
++}
++
++// ============================================================================
++// Subscriber XSUAA Token Exchange
++// CRITICAL: For multi-tenant SaaS, the authorization code must be exchanged
++// at the SUBSCRIBER's XSUAA, not the provider's. The code was issued by the
++// subscriber's XSUAA and can only be redeemed there.
++// ============================================================================
++
++function getXsuaaCredentials() {
++    return cds.env.requires.auth?.credentials || cds.env.requires.xsuaa?.credentials;
++}
++
++function buildAuthHeader() {
++    const creds = getXsuaaCredentials();
++    return `Basic ${Buffer.from(`${creds?.clientid}:${creds?.clientsecret}`).toString("base64")}`;
++}
++
+ /**
+- * Reusable OAuth token handler function
+- * Handles both GET and POST requests by extracting parameters from both query and body
+- * This unified approach follows lemaiwo's successful pattern and works around MCP SDK inconsistencies
++ * Builds the subscriber's XSUAA token URL based on the request host.
++ * For multi-tenant apps, the subdomain in the approuter URL maps to the subscriber's XSUAA subdomain.
+  */
++function buildSubscriberTokenUrl(req) {
++    const creds = getXsuaaCredentials();
++    const effectiveHost = utils_1.getEffectiveHost(req);
++    let subdomain = effectiveHost.split(".")[0];
++
++    // Handle local development (localhost doesn't have subdomains)
++    const isLocalDev = subdomain.includes(':') || subdomain === 'localhost' || subdomain.startsWith('127');
++    if (isLocalDev) {
++        subdomain = creds?.identityzone || creds?.zid || subdomain;
++        logger_1.LOGGER.debug("[MCP-TOKEN] Local dev detected, using identity zone", { subdomain });
++    }
++    
++    // For multi-tenant apps, strip app prefix from subdomain if present
++    const appName = process.env.XSAPPNAME?.split('!')[0];
++    if (appName && subdomain.startsWith(appName + '-')) {
++        subdomain = subdomain.substring(appName.length + 1);
++        logger_1.LOGGER.debug("[MCP-TOKEN] Stripped app prefix from subdomain", { subdomain, appName });
++    }
++
++    const domain = creds?.uaadomain || "authentication.eu10.hana.ondemand.com";
++    const tokenUrl = `https://${subdomain}.${domain}/oauth/token`;
++    
++    logger_1.LOGGER.debug("[MCP-TOKEN] Built subscriber XSUAA token URL", { tokenUrl, subdomain });
++    
++    return tokenUrl;
++}
++
++async function exchangeCodeAtSubscriberXsuaa(req, code, redirectUri, codeVerifier) {
++    const tokenUrl = buildSubscriberTokenUrl(req);
++    const authHeader = buildAuthHeader();
++    
++    const params = new URLSearchParams({ 
++        grant_type: "authorization_code", 
++        code, 
++        redirect_uri: redirectUri 
++    });
++    if (codeVerifier) params.set("code_verifier", codeVerifier);
++
++    logger_1.LOGGER.debug("[MCP-TOKEN] Exchanging auth code at subscriber XSUAA", { tokenUrl, redirectUri });
++
++    const response = await fetch(tokenUrl, {
++        method: "POST",
++        headers: { 
++            "Content-Type": "application/x-www-form-urlencoded", 
++            Authorization: authHeader 
++        },
++        body: params
++    });
++
++    if (!response.ok) {
++        const errorText = await response.text();
++        let errorData;
++        try { 
++            errorData = JSON.parse(errorText); 
++        } catch { 
++            errorData = { error: errorText }; 
++        }
++        logger_1.LOGGER.error("[MCP-TOKEN] Auth code exchange failed", {
++            status: response.status,
++            error: errorData.error_description || errorData.error,
++            tokenUrl
++        });
++        throw new Error(`${response.status} ${errorData.error_description || errorData.error}`);
++    }
++
++    const tokenData = await response.json();
++    const claims = decodeJwtPayload(tokenData.access_token);
++    
++    logger_1.LOGGER.info("[MCP-TOKEN] Auth code exchange successful", {
++        zid: claims?.zid,
++        zdn: claims?.ext_attr?.zdn,
++        expiresIn: tokenData.expires_in
++    });
++
++    return tokenData;
++}
++
++/**
++ * Exchange a user token for an application-scoped token at the SUBSCRIBER's XSUAA.
++ * 
++ * This function performs a jwt-bearer grant to exchange a user's access token for
++ * a token with application-level scopes. The exchange MUST happen at the subscriber's
++ * XSUAA because:
++ * 
++ * 1. The input token was issued by the subscriber's XSUAA
++ * 2. The provider's XSUAA doesn't trust the subscriber's XSUAA as an issuer
++ * 3. Only the issuing XSUAA can perform jwt-bearer exchanges on its own tokens
++ * 
++ * **Scope Handling**: We intentionally DO NOT specify the `scope` parameter.
++ * The provider's xsappname (e.g., "mymediset-dev!t499687") contains a tenant-specific
++ * ID that is invalid at the subscriber's XSUAA. By omitting scope, XSUAA automatically
++ * derives appropriate scopes from:
++ * - The assertion token's existing scopes
++ * - The client's configured permissions at the subscriber's tenant
++ * 
++ * @param {import('express').Request} req - Express request (used to derive subscriber subdomain)
++ * @param {object} tokenData - Initial token response from authorization code exchange
++ * @param {string} tokenData.access_token - The user's access token to exchange
++ * @returns {Promise<object>} Token response with application scopes
++ * 
++ * @example
++ * // Get user token:
++ * const userToken = await exchangeCodeAtSubscriberXsuaa(req, code, redirectUri);
++ * // Get app-scoped token:
++ * const appToken = await exchangeForAppScopesAtSubscriber(req, userToken);
++ */
++async function exchangeForAppScopesAtSubscriber(req, tokenData) {
++    const tokenUrl = buildSubscriberTokenUrl(req);
++    const authHeader = buildAuthHeader();
++    const inputClaims = decodeJwtPayload(tokenData.access_token);
++
++    const params = new URLSearchParams({
++        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
++        response_type: "token+id_token",
++        assertion: tokenData.access_token
++    });
++    // Scope is intentionally NOT set - see JSDoc above
++
++    logger_1.LOGGER.debug("[MCP-TOKEN] Exchanging for app scopes via jwt-bearer", { tokenUrl });
++
++    const response = await fetch(tokenUrl, {
++        method: "POST",
++        headers: {
++            "Authorization": authHeader,
++            "Content-Type": "application/x-www-form-urlencoded"
++        },
++        body: params.toString()
++    });
++
++    if (!response.ok) {
++        const errorText = await response.text();
++        let errorData;
++        try { 
++            errorData = JSON.parse(errorText); 
++        } catch { 
++            errorData = { error: errorText }; 
++        }
++        logger_1.LOGGER.error("[MCP-TOKEN] jwt-bearer exchange failed", {
++            status: response.status,
++            error: errorData.error_description || errorData.error,
++            tokenUrl
++        });
++        throw new Error(`Token exchange for scopes failed: ${response.status} ${errorData.error_description || errorData.error}.`);
++    }
++
++    const scopedToken = await response.json();
++    const claims = decodeJwtPayload(scopedToken.access_token);
++    
++    // Critical: Check if tenant context changed during exchange
++    if (inputClaims?.zid !== claims?.zid) {
++        logger_1.LOGGER.error("[MCP-TOKEN] CRITICAL: Tenant context changed during jwt-bearer exchange", {
++            inputZid: inputClaims?.zid,
++            inputZdn: inputClaims?.ext_attr?.zdn,
++            outputZid: claims?.zid,
++            outputZdn: claims?.ext_attr?.zdn,
++            impact: "Destination lookups will fail"
++        });
++    }
++
++    logger_1.LOGGER.info("[MCP-TOKEN] jwt-bearer exchange successful", {
++        zid: claims?.zid,
++        zdn: claims?.ext_attr?.zdn,
++        expiresIn: scopedToken.expires_in
++    });
++
++    return scopedToken;
++}
++
++// ============================================================================
++// Authorization Code Grant Handler
++// ============================================================================
++
++async function handleAuthorizationCodeGrant(req, res, code, redirectUri, codeVerifier, xsuaaService) {
++    // Check cache first (allows same code to work for Claude.ai AND mcp-remote)
++    const cached = tokenCache.get(code);
++    if (cached && Date.now() - cached.createdAt < TOKEN_CACHE_TTL_MS) {
++        logger_1.LOGGER.debug("[MCP-TOKEN] Returning cached token");
++        return res.json(cached.token);
++    }
++
++    // Step 1: Exchange code at SUBSCRIBER's XSUAA (CRITICAL for multi-tenant)
++    const tokenData = await exchangeCodeAtSubscriberXsuaa(req, code, redirectUri, codeVerifier);
++
++    // Step 2: Exchange for app scopes via jwt-bearer grant at SUBSCRIBER's XSUAA
++    const scopedToken = await exchangeForAppScopesAtSubscriber(req, tokenData);
++    const scopedClaims = decodeJwtPayload(scopedToken.access_token);
++
++    // Cache for subsequent exchange attempts
++    tokenCache.set(code, { token: scopedToken, createdAt: Date.now() });
++    
++    logger_1.LOGGER.info("[MCP-TOKEN] Token exchange complete", {
++        zid: scopedClaims?.zid,
++        zdn: scopedClaims?.ext_attr?.zdn,
++        expiresIn: scopedToken.expires_in
++    });
++
++    res.json(scopedToken);
++}
++
++// ============================================================================
++// Main Token Request Handler
++// ============================================================================
++
+ async function handleTokenRequest(req, res, xsuaaService) {
+     try {
+-        const params = { ...req.query, ...req.body };
+-        const { grant_type, code, redirect_uri, refresh_token, code_verifier } = params;
++        const { grant_type, code, redirect_uri, refresh_token, code_verifier } = { ...req.query, ...req.body };
++
++        logger_1.LOGGER.debug("[MCP-TOKEN] Token request received", { grantType: grant_type });
++
+         if (grant_type === "authorization_code") {
+             if (!code || !redirect_uri) {
+-                res.status(400).json({
+-                    error: "invalid_request",
+-                    error_description: "Missing code or redirect_uri",
+-                });
+-                return;
++                logger_1.LOGGER.warn("[MCP-TOKEN] Missing code or redirect_uri");
++                return res.status(400).json({ error: "invalid_request", error_description: "Missing code or redirect_uri" });
+             }
+-            const tokenData = await xsuaaService.exchangeCodeForToken(code, redirect_uri, code_verifier);
+-            const scopedToken = await xsuaaService.getApplicationScopes(tokenData);
+-            logger_1.LOGGER.debug("Scopes in token:", scopedToken.scope);
+-            logger_1.LOGGER.debug("[AUTH] Token exchange successful");
+-            res.json(scopedToken);
++            return handleAuthorizationCodeGrant(req, res, code, redirect_uri, code_verifier, xsuaaService);
+         }
+-        else if (grant_type === "refresh_token") {
++
++        if (grant_type === "refresh_token") {
+             if (!refresh_token) {
+-                res.status(400).json({
+-                    error: "invalid_request",
+-                    error_description: "Missing refresh_token",
+-                });
+-                return;
++                logger_1.LOGGER.warn("[MCP-TOKEN] Missing refresh_token");
++                return res.status(400).json({ error: "invalid_request", error_description: "Missing refresh_token" });
+             }
+-            const tokenData = await xsuaaService.refreshAccessToken(refresh_token);
+-            logger_1.LOGGER.debug("[AUTH] Token refresh successful");
+-            res.json(tokenData);
+-        }
+-        else {
+-            res.status(400).json({
+-                error: "unsupported_grant_type",
+-                error_description: "Only authorization_code and refresh_token are supported",
+-            });
++            const refreshedToken = await xsuaaService.refreshAccessToken(refresh_token);
++            logger_1.LOGGER.debug("[MCP-TOKEN] Token refresh successful");
++            return res.json(refreshedToken);
+         }
+-    }
+-    catch (error) {
+-        logger_1.LOGGER.error("OAuth token error:", error);
+-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+-        res.status(400).json({
+-            error: "invalid_grant",
+-            error_description: errorMessage,
++
++        logger_1.LOGGER.warn("[MCP-TOKEN] Unsupported grant type", { grantType: grant_type });
++        return res.status(400).json({ error: "unsupported_grant_type", error_description: "Only authorization_code and refresh_token supported" });
++    } catch (error) {
++        logger_1.LOGGER.error("[MCP-TOKEN] Token exchange failed", { 
++            error: error?.message
+         });
++        res.status(400).json({ error: "invalid_grant", error_description: error instanceof Error ? error.message : "Unknown error" });
++    }
++}
++
++// ============================================================================
++// Exports for Testing
++// ============================================================================
++
++/**
++ * Extract subscriber subdomain from effective host.
++ * Exported for unit testing.
++ * 
++ * @param {string} effectiveHost - The host from x-forwarded-host or host header
++ * @param {object} options - Options
++ * @param {string} options.appName - App name to strip from subdomain (from XSAPPNAME)
++ * @param {string} options.fallbackSubdomain - Fallback subdomain for local dev
++ * @returns {object} Result with subdomain, isLocalDev, and wasStripped flags
++ */
++function extractSubscriberSubdomain(effectiveHost, options = {}) {
++    const { appName, fallbackSubdomain = "localhost" } = options;
++    
++    // Remove port if present
++    const hostWithoutPort = effectiveHost.split(':')[0];
++    
++    // Extract first part of hostname
++    const firstPart = hostWithoutPort.split('.')[0];
++    
++    // Check if it's local development
++    const isLocalDev = firstPart === 'localhost' || firstPart === '127' || hostWithoutPort.startsWith('127.0.0.1');
++    
++    if (isLocalDev) {
++        return { subdomain: fallbackSubdomain, isLocalDev: true, wasStripped: false };
++    }
++    
++    // Try to strip app prefix if appName is provided
++    let subdomain = firstPart;
++    let wasStripped = false;
++    
++    if (appName && firstPart.startsWith(appName + '-')) {
++        const withoutPrefix = firstPart.substring(appName.length + 1);
++        if (withoutPrefix) {
++            subdomain = withoutPrefix;
++            wasStripped = true;
++        }
+     }
++    
++    return { subdomain, isLocalDev: false, wasStripped };
++}
++
++/**
++ * Build subscriber XSUAA token URL.
++ * Exported for unit testing.
++ * 
++ * @param {string} subdomain - Subscriber subdomain
++ * @param {string} uaaDomain - UAA domain (e.g., "authentication.eu10.hana.ondemand.com")
++ * @returns {string} Full XSUAA token URL
++ */
++function buildSubscriberXsuaaTokenUrl(subdomain, uaaDomain) {
++    return `https://${subdomain}.${uaaDomain}/oauth/token`;
+ }
++
++// Export test utilities alongside the main export
++module.exports.extractSubscriberSubdomain = extractSubscriberSubdomain;
++module.exports.buildSubscriberXsuaaTokenUrl = buildSubscriberXsuaaTokenUrl;
+diff --git a/node_modules/@gavdi/cap-mcp/lib/auth/utils.js b/node_modules/@gavdi/cap-mcp/lib/auth/utils.js
+index d756d37..5dc153e 100644
+--- a/node_modules/@gavdi/cap-mcp/lib/auth/utils.js
++++ b/node_modules/@gavdi/cap-mcp/lib/auth/utils.js
+@@ -9,287 +9,456 @@ exports.registerAuthMiddleware = registerAuthMiddleware;
+ exports.hasToolOperationAccess = hasToolOperationAccess;
+ exports.getWrapAccesses = getWrapAccesses;
+ exports.useMockAuth = useMockAuth;
++exports.getProtocol = getProtocol;
++exports.getEffectiveHost = getEffectiveHost;
+ const express_1 = __importDefault(require("express"));
+ const helmet_1 = __importDefault(require("helmet"));
+ const factory_1 = require("./factory");
+ const xsuaa_service_1 = require("./xsuaa-service");
+ const handlers_1 = require("./handlers");
+ const logger_1 = require("../logger");
+-/**
+- * @fileoverview Authentication utilities for MCP-CAP integration.
+- *
+- * This module provides utilities for integrating CAP authentication with MCP servers.
+- * It supports all standard CAP authentication types and provides functions for:
+- * - Determining authentication status
+- * - Managing user access rights
+- * - Registering authentication middleware
+- *
+- * Supported CAP authentication types:
+- * - 'dummy': No authentication (privileged access)
+- * - 'mocked': Mock users with predefined credentials
+- * - 'basic': HTTP Basic Authentication
+- * - 'jwt': Generic JWT token validation
+- * - 'xsuaa': SAP BTP XSUAA OAuth2/JWT authentication
+- * - 'ias': SAP Identity Authentication Service
+- * - Custom string types for user-defined authentication strategies
+- *
+- * Access CAP auth configuration via: cds.env.requires.auth.kind
+- */
++
+ /* @ts-ignore */
+-const cds = global.cds || require("@sap/cds"); // This is a work around for missing cds context
+-/**
+- * Determines whether authentication is enabled for the MCP plugin.
+- *
+- * This function checks the plugin configuration to determine if authentication
+- * should be enforced. When authentication is disabled ('none'), the plugin
+- * operates with privileged access. For security reasons, this function defaults
+- * to enabling authentication unless explicitly disabled.
+- *
+- * @param configEnabled - The MCP authentication configuration type
+- * @returns true if authentication is enabled, false if disabled
+- *
+- * @example
+- * ```typescript
+- * const authEnabled = isAuthEnabled('inherit'); // true
+- * const noAuth = isAuthEnabled('none');         // false
+- * ```
+- *
+- * @since 1.0.0
+- */
++const cds = global.cds || require("@sap/cds");
++
++// ============================================================================
++// Auth Configuration
++// ============================================================================
++
+ function isAuthEnabled(configEnabled) {
+-    if (configEnabled === "none")
+-        return false;
+-    return true; // For now this will always default to true, as we do not want to falsely give access
++    return configEnabled !== "none";
+ }
+-/**
+- * Retrieves the appropriate user context for CAP service operations.
+- *
+- * This function returns the correct user context based on whether authentication
+- * is enabled. When authentication is enabled, it uses the current authenticated
+- * user from the CAP context. When disabled, it provides privileged access.
+- *
+- * The returned User object is used for:
+- * - Authorization checks in CAP services
+- * - Audit logging and traceability
+- * - Row-level security and data filtering
+- *
+- * @param authEnabled - Whether authentication is currently enabled
+- * @returns CAP User object with appropriate access rights
+- *
+- * @example
+- * ```typescript
+- * const user = getAccessRights(true);  // Returns cds.context.user
+- * const admin = getAccessRights(false); // Returns cds.User.privileged
+- *
+- * // Use in CAP service calls
+- * const result = await service.tx({ user }).run(query);
+- * ```
+- *
+- * @throws {Error} When authentication is enabled but no user context exists
+- * @since 1.0.0
+- */
++
+ function getAccessRights(authEnabled) {
+     return authEnabled ? cds.context.user : cds.User.privileged;
+ }
+-/**
+- * Registers comprehensive authentication middleware for MCP endpoints.
+- *
+- * This function sets up the complete authentication middleware chain for MCP endpoints.
+- * It integrates with CAP's authentication system by:
+- *
+- * 1. Applying all CAP 'before' middleware (including auth middleware)
+- * 2. Adding error handling for authentication failures
+- * 3. Adding MCP-specific authentication validation
+- *
+- * The middleware chain handles all CAP authentication types automatically and
+- * converts authentication errors to JSON-RPC 2.0 compliant responses.
+- *
+- * Middleware execution order:
+- * 1. CAP middleware chain (authentication, logging, etc.)
+- * 2. Authentication error handler
+- * 3. MCP authentication validator
+- *
+- * @param expressApp - Express application instance to register middleware on
+- *
+- * @example
+- * ```typescript
+- * const app = express();
+- * registerAuthMiddleware(app);
+- *
+- * // Now all /mcp routes are protected with CAP authentication
+- * app.post('/mcp', mcpHandler);
+- * ```
+- *
+- * @throws {Error} When CAP middleware chain is not properly initialized
+- * @since 1.0.0
+- */
++
++function useMockAuth(authKind) {
++    return authKind !== "jwt" && authKind !== "ias" && authKind !== "xsuaa";
++}
++
++// ============================================================================
++// Auth Middleware Registration
++// ============================================================================
++
+ function registerAuthMiddleware(expressApp) {
+-    const middlewares = cds.middlewares.before; // No types exists for this part of the CDS library
+-    // Build array of auth middleware to apply
+-    const authMiddleware = []; // Required any as a workaround for untyped cds middleware
+-    // Add CAP middleware
++    logger_1.LOGGER.debug("[MCP-INIT] Registering authentication middleware for MCP endpoints");
++    
++    const middlewares = cds.middlewares.before;
++    const authMiddleware = [];
++
+     middlewares.forEach((mw) => {
+         const process = mw.factory();
+-        if (process && process.length > 0) {
+-            authMiddleware.push(process);
+-        }
++        if (process && process.length > 0) authMiddleware.push(process);
+     });
+-    // Add MCP auth middleware
++
+     authMiddleware.push((0, factory_1.errorHandlerFactory)());
+     authMiddleware.push((0, factory_1.authHandlerFactory)());
+-    // If we require OAuth then we should also apply for that
++
+     configureOAuthProxy(expressApp);
+-    // Apply auth middleware to all /mcp routes EXCEPT health
+     expressApp?.use(/^\/mcp(?!\/health).*/, ...authMiddleware);
++    
++    logger_1.LOGGER.info("[MCP-INIT] Auth middleware registered for /mcp routes", {
++        middlewareCount: authMiddleware.length
++    });
+ }
+-/**
+- * Configures OAuth proxy middleware for enterprise authentication scenarios.
+- *
+- * This function sets up a proxy OAuth provider that integrates with SAP BTP
+- * authentication services (XSUAA/IAS) to enable MCP clients to authenticate
+- * through standard OAuth2 flows. The proxy handles:
+- *
+- * - OAuth2 authorization and token endpoints
+- * - Access token verification and validation
+- * - Client credential management
+- * - Integration with CAP authentication configuration
+- *
+- * The OAuth proxy is only configured for enterprise authentication types
+- * (jwt, xsuaa, ias) and skips configuration for basic auth types.
+- *
+- * @param expressApp - Express application instance to register OAuth routes on
+- *
+- * @throws {Error} When required OAuth credentials are missing or invalid
+- *
+- * @example
+- * ```typescript
+- * // Automatically called by registerAuthMiddleware()
+- * // Requires CAP auth configuration:
+- * // cds.env.requires.auth = {
+- * //   kind: 'xsuaa',
+- * //   credentials: {
+- * //     clientid: 'your-client-id',
+- * //     clientsecret: 'your-client-secret',
+- * //     url: 'https://your-tenant.authentication.sap.hana.ondemand.com'
+- * //   }
+- * // }
+- * ```
+- *
+- * @internal This function is called internally by registerAuthMiddleware()
+- * @since 1.0.0
+- */
++
+ function configureOAuthProxy(expressApp) {
+     const config = cds.env.requires.auth;
+-    const kind = config.kind;
+-    const credentials = config.credentials;
+-    // PRESERVE existing logic - skip OAuth proxy for basic auth types
+-    if (kind === "dummy" || kind === "mocked" || kind === "basic")
++    const { kind, credentials } = config;
++
++    logger_1.LOGGER.debug("[MCP-INIT] Configuring OAuth proxy", { authKind: kind });
++
++    if (kind === "dummy" || kind === "mocked" || kind === "basic") {
++        logger_1.LOGGER.debug("[MCP-INIT] Skipping OAuth proxy for auth kind", { kind });
+         return;
+-    // PRESERVE existing validation
+-    if (!credentials ||
+-        !credentials.clientid ||
+-        !credentials.clientsecret ||
+-        !credentials.url) {
++    }
++
++    if (!credentials?.clientid || !credentials?.clientsecret || !credentials?.url) {
++        logger_1.LOGGER.error("[MCP-INIT] Invalid security credentials for OAuth proxy", {
++            hasClientId: !!credentials?.clientid,
++            hasClientSecret: !!credentials?.clientsecret,
++            hasUrl: !!credentials?.url
++        });
+         throw new Error("Invalid security credentials");
+     }
++
+     registerOAuthEndpoints(expressApp, credentials, kind);
+ }
+-/**
+- * Determines the correct protocol (HTTP/HTTPS) for URL construction.
+- * Accounts for reverse proxy headers and production environment defaults.
+- *
+- * @param req - Express request object
+- * @returns Protocol string ('http' or 'https')
+- */
++
++// ============================================================================
++// Protocol & Host Resolution
++// ============================================================================
++
+ function getProtocol(req) {
+-    // Check for reverse proxy header first (most reliable)
+-    if (req.headers["x-forwarded-proto"]) {
+-        return req.headers["x-forwarded-proto"];
+-    }
+-    // Default to HTTPS in production environments
++    if (req.headers["x-forwarded-proto"]) return req.headers["x-forwarded-proto"];
+     const isProduction = process.env.NODE_ENV === "production" || process.env.VCAP_APPLICATION;
+     return isProduction ? "https" : req.protocol;
+ }
++
++const ALLOWED_SCHEMES = ['cursor', 'vscode', 'claude', 'code-insiders', 'vscodium', 'myapp'];
++
+ /**
+- * Registers OAuth endpoints for XSUAA integration
+- * Only called for jwt/xsuaa/ias auth types with valid credentials
++ * Resolves the effective host for multi-tenant routing.
++ * Returns subscriber approuter URL, not internal CF app URL.
++ * 
++ * CRITICAL: This function determines which tenant's URLs are used for OAuth flows.
++ * If resolved incorrectly, OAuth callbacks and metadata will point to wrong tenant.
+  */
++function getEffectiveHost(req) {
++    const xForwardedHost = req.headers["x-forwarded-host"];
++    const xCustomHost = req.headers["x-custom-host"];
++    const xApprouterHost = req.headers["x-approuter-host"];
++    const rawHost = req.get("host") || "";
++    const appDomain = process.env.appDomain;
++    const tenantSeparator = process.env.tenantSeparator || '.';
++    const isCfAppUrl = rawHost.includes('.cfapps.') || rawHost.includes('.hana.ondemand.com');
++
++    logger_1.LOGGER.debug("[MCP-HOST] Resolving effective host for request", {
++        rawHost,
++        xForwardedHost: xForwardedHost || null,
++        xCustomHost: xCustomHost || null,
++        xApprouterHost: xApprouterHost || null,
++        appDomain: appDomain || null,
++        isCfAppUrl
++    });
++
++    // Priority 1: Forwarded headers from approuter (most reliable for multi-tenant)
++    if (xForwardedHost) {
++        logger_1.LOGGER.info("[MCP-HOST] Host resolved via x-forwarded-host header", { 
++            host: xForwardedHost,
++            source: "x-forwarded-host",
++            subdomain: xForwardedHost.split(".")[0]
++        });
++        return xForwardedHost;
++    }
++    if (xCustomHost) {
++        logger_1.LOGGER.info("[MCP-HOST] Host resolved via x-custom-host header", { 
++            host: xCustomHost,
++            source: "x-custom-host",
++            subdomain: xCustomHost.split(".")[0]
++        });
++        return xCustomHost;
++    }
++    if (xApprouterHost) {
++        logger_1.LOGGER.info("[MCP-HOST] Host resolved via x-approuter-host header", { 
++            host: xApprouterHost,
++            source: "x-approuter-host",
++            subdomain: xApprouterHost.split(".")[0]
++        });
++        return xApprouterHost;
++    }
++
++    // Priority 2: Construct from appDomain env var
++    if (appDomain) {
++        const { subdomain, resolution } = extractSubdomainFromCfUrl(req, rawHost, isCfAppUrl, appDomain);
++        const host = `${subdomain}${tenantSeparator}${appDomain}`;
++        logger_1.LOGGER.info("[MCP-HOST] Host constructed from appDomain environment variable", { 
++            host, 
++            subdomain,
++            appDomain,
++            resolution,
++            source: "appDomain-env"
++        });
++        return host;
++    }
++
++    // Priority 3: Raw host (local development only)
++    if (!isCfAppUrl) {
++        logger_1.LOGGER.debug("[MCP-HOST] Using raw host for local development", { 
++            host: rawHost,
++            source: "raw-host-local"
++        });
++        return rawHost;
++    }
++
++    // Error: CF URL without appDomain - this will cause multi-tenant issues
++    logger_1.LOGGER.error("[MCP-HOST] CRITICAL: CF app URL detected but no appDomain env var set", {
++        rawHost,
++        impact: "OAuth callbacks will use internal CF URL instead of approuter URL",
++        fix: "Set appDomain env var (e.g., 'dev.mymediset.cloud') in manifest.yml or mta.yaml"
++    });
++    return rawHost;
++}
++
++function extractSubdomainFromCfUrl(req, rawHost, isCfAppUrl, appDomain) {
++    let subdomain = rawHost.split(".")[0];
++    let resolution = 'appDomain';
++
++    if (!isCfAppUrl) {
++        logger_1.LOGGER.debug("[MCP-HOST] Not a CF URL, using raw subdomain", { subdomain });
++        return { subdomain, resolution };
++    }
++
++    // Try extracting from forwarding headers
++    logger_1.LOGGER.debug("[MCP-HOST] Attempting to extract subdomain from CF forwarding headers");
++    
++    const extracted = tryExtractSubdomain(req.headers["x-cf-forwarded-url"], 'cf-forwarded-url')
++        || tryExtractSubdomain(req.headers["origin"], 'origin', '.cfapps.')
++        || tryExtractSubdomain(req.headers["referer"], 'referer', '.cfapps.');
++
++    if (extracted) {
++        logger_1.LOGGER.debug("[MCP-HOST] Subdomain extracted from header", extracted);
++        return extracted;
++    }
++
++    logger_1.LOGGER.warn("[MCP-HOST] CF URL without usable forwarding headers - using raw subdomain", { 
++        rawHost, 
++        subdomain,
++        warning: "Subdomain may be wrong for multi-tenant scenarios",
++        headersChecked: ["x-cf-forwarded-url", "origin", "referer"]
++    });
++    return { subdomain, resolution: 'appDomain-cf-fallback' };
++}
++
++function tryExtractSubdomain(url, source, excludePattern) {
++    if (!url) return null;
++    if (excludePattern && url.includes(excludePattern)) return null;
++    try {
++        const subdomain = new URL(url).hostname.split(".")[0];
++        logger_1.LOGGER.debug("[MCP-HOST] Extracted subdomain from URL", { source, url, subdomain });
++        return { subdomain, resolution: source };
++    } catch { 
++        return null; 
++    }
++}
++
++// ============================================================================
++// Subscriber XSUAA URL Builder
++// ============================================================================
++
++function getSubscriberXsuaaUrl(req, credentials, urlPath) {
++    let subdomain = getEffectiveHost(req).split(".")[0];
++    const originalSubdomain = subdomain;
++
++    // Check if subdomain looks like localhost (local development)
++    const isLocalDev = subdomain.includes(':') || subdomain === 'localhost' || subdomain.startsWith('127');
++    
++    if (isLocalDev) {
++        subdomain = credentials.identityzone || credentials.zid || subdomain;
++        logger_1.LOGGER.debug("[MCP-XSUAA] Local development detected - using identity zone as subdomain", { 
++            originalSubdomain,
++            identityZone: subdomain,
++            source: credentials.identityzone ? "identityzone" : (credentials.zid ? "zid" : "fallback")
++        });
++    }
++
++    const domain = credentials.uaadomain || "authentication.eu10.hana.ondemand.com";
++    const xsuaaUrl = `https://${subdomain}.${domain}${urlPath}`;
++    
++    logger_1.LOGGER.info("[MCP-XSUAA] Built subscriber XSUAA URL", {
++        xsuaaUrl,
++        subdomain,
++        domain,
++        urlPath,
++        isLocalDev,
++        purpose: urlPath.includes('authorize') ? 'authorization' : 
++                 urlPath.includes('token') ? 'token-exchange' : 'other'
++    });
++    
++    return xsuaaUrl;
++}
++
++// ============================================================================
++// Custom Scheme Handling
++// ============================================================================
++
++function isCustomScheme(uri) {
++    return uri && !uri.startsWith('http://') && !uri.startsWith('https://');
++}
++
++function isValidCustomScheme(uri) {
++    if (!isCustomScheme(uri)) return false;
++    if (/^(javascript|data|file|about):/i.test(uri)) return false;
++    const match = uri.match(/^([a-z0-9-]+):/i);
++    return match && ALLOWED_SCHEMES.includes(match[1].toLowerCase());
++}
++
++function escapeHtml(str) {
++    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
++}
++
++function encodeProxyState(originalState, customUri) {
++    return Buffer.from(JSON.stringify({ s: originalState, r: customUri })).toString('base64url');
++}
++
++function decodeProxyState(state) {
++    if (!state || typeof state !== 'string') return null;
++    try {
++        const d = JSON.parse(Buffer.from(state, 'base64url').toString());
++        return d.r ? { customUri: d.r, originalState: d.s } : null;
++    } catch { return null; }
++}
++
++function renderCustomSchemeRedirect(url) {
++    const safeUrl = escapeHtml(url);
++    const jsUrl = url.replace(/"/g, '\\"');
++    return `<!DOCTYPE html>
++<html><head><meta charset="utf-8"><title>Redirecting...</title></head>
++<body style="font-family:system-ui;text-align:center;padding:50px">
++<h2>Authorization Complete</h2>
++<p><a href="${safeUrl}" style="display:inline-block;padding:12px 24px;background:#0066cc;color:#fff;text-decoration:none;border-radius:6px">Open Application</a></p>
++<p style="font-size:12px;color:#666">Or copy: <code style="background:#f5f5f5;padding:4px 8px">${safeUrl}</code></p>
++<script>location.href="${jsUrl}"</script>
++</body></html>`;
++}
++
++// ============================================================================
++// OAuth Endpoint Registration
++// ============================================================================
++
+ function registerOAuthEndpoints(expressApp, credentials, kind) {
++    logger_1.LOGGER.debug("[MCP-OAUTH] Registering OAuth endpoints", { authKind: kind });
++    
+     const xsuaaService = new xsuaa_service_1.XSUAAService();
+-    // Fetch endpoints from OIDC configuration
+     xsuaaService.discoverOAuthEndpoints();
+-    // Add JSON and URL-encoded body parsing for OAuth endpoints
++
++    // Middleware for OAuth routes
+     expressApp.use("/oauth", express_1.default.json());
+     expressApp.use("/oauth", express_1.default.urlencoded({ extended: true }));
+-    // Apply helmet security middleware only to OAuth routes
+     expressApp.use("/oauth", (0, helmet_1.default)({
+         contentSecurityPolicy: {
+             directives: {
+                 defaultSrc: ["'self'"],
+                 styleSrc: ["'self'", "'unsafe-inline'"],
+-                scriptSrc: ["'self'"],
++                scriptSrc: ["'self'", "'unsafe-inline'"],
+                 imgSrc: ["'self'", "data:", "https:"],
+             },
+         },
+     }));
+-    // OAuth Authorization endpoint - stateless redirect to XSUAA
++
++    // RFC 9728: Protected Resource Metadata
++    expressApp.get("/.well-known/oauth-protected-resource", (req, res) => {
++        const baseUrl = `${getProtocol(req)}://${getEffectiveHost(req)}`;
++        const resourceUrl = `${baseUrl}/mcp`;
++
++        logger_1.LOGGER.debug("[MCP-OAUTH] Protected resource metadata requested", { 
++            resourceUrl,
++            baseUrl
++        });
++
++        res.json({
++            resource: resourceUrl,
++            authorization_servers: [baseUrl],
++            bearer_methods_supported: ["header"],
++            resource_documentation: `${baseUrl}/mcp/health`,
++            scopes_supported: ["openid"]
++        });
++    });
++
++    // OAuth Authorization
+     expressApp.get("/oauth/authorize", (req, res) => {
+-        const { state, redirect_uri, client_id, code_challenge, code_challenge_method, scope, } = req.query;
+-        // Client validation and redirect URI validation is handled by XSUAA
+-        // We delegate all client management to XSUAA's built-in OAuth server
+-        const protocol = getProtocol(req);
+-        const redirectUri = redirect_uri || `${protocol}://${req.get("host")}/oauth/callback`;
+-        const authUrl = xsuaaService.getAuthorizationUrl(redirectUri, client_id ?? "", state, code_challenge, code_challenge_method, scope);
+-        res.redirect(authUrl);
++        const { state, redirect_uri, client_id, code_challenge, code_challenge_method, scope } = req.query;
++        const baseUrl = `${getProtocol(req)}://${getEffectiveHost(req)}`;
++
++        logger_1.LOGGER.debug("[MCP-OAUTH] Authorization request received");
++
++        let redirectUri = redirect_uri || `${baseUrl}/oauth/callback`;
++        let proxyState = state;
++
++        if (isCustomScheme(redirectUri)) {
++            if (!isValidCustomScheme(redirectUri)) {
++                logger_1.LOGGER.warn("[MCP-OAUTH] Invalid custom scheme rejected", { 
++                    scheme: redirectUri?.split(':')[0]
++                });
++                return res.status(400).json({ error: 'invalid_request', error_description: 'Invalid redirect URI scheme' });
++            }
++            logger_1.LOGGER.debug("[MCP-OAUTH] Proxying custom scheme redirect URI");
++            proxyState = encodeProxyState(state, redirectUri);
++            redirectUri = `${baseUrl}/oauth/callback`;
++        }
++
++        const params = new URLSearchParams({
++            response_type: "code",
++            redirect_uri: redirectUri,
++            client_id: client_id ?? credentials.clientid
++        });
++        if (code_challenge) params.set("code_challenge", code_challenge);
++        if (code_challenge_method) params.set("code_challenge_method", code_challenge_method);
++        if (scope) params.set("scope", scope);
++        if (proxyState) params.set("state", proxyState);
++
++        const xsuaaUrl = `${getSubscriberXsuaaUrl(req, credentials, "/oauth/authorize")}?${params}`;
++        
++        logger_1.LOGGER.debug("[MCP-OAUTH] Redirecting to XSUAA", { 
++            subdomain: getEffectiveHost(req).split(".")[0]
++        });
++        
++        res.redirect(xsuaaUrl);
+     });
+-    // OAuth Callback endpoint - stateless token exchange
++
++    // OAuth Callback
+     expressApp.get("/oauth/callback", async (req, res) => {
+-        const { code, state, error, error_description, redirect_uri, code_verifier, } = req.query;
+-        logger_1.LOGGER.debug("[AUTH] Callback received", code, state);
+-        if (error) {
+-            res.status(400).json({
+-                error: "authorization_failed",
+-                error_description: error_description || error,
++        const { code, state, error, error_description } = req.query;
++        const proxy = decodeProxyState(state);
++
++        logger_1.LOGGER.debug("[MCP-OAUTH] Callback received from XSUAA", {
++            hasCode: !!code,
++            hasError: !!error,
++            hasProxyState: !!proxy
++        });
++
++        // Custom scheme: redirect back to client
++        if (proxy) {
++            if (!isValidCustomScheme(proxy.customUri)) {
++                logger_1.LOGGER.warn("[MCP-OAUTH] Invalid custom scheme in callback state", {
++                    scheme: proxy.customUri?.split(':')[0]
++                });
++                return res.status(400).json({ error: 'invalid_request', error_description: 'Invalid scheme' });
++            }
++
++            logger_1.LOGGER.info("[MCP-OAUTH] Redirecting to custom scheme client", { 
++                scheme: proxy.customUri.split(':')[0],
++                hasCode: !!code,
++                hasError: !!error
+             });
+-            return;
++
++            const params = new URLSearchParams();
++            if (code) params.set('code', code);
++            if (error) params.set('error', error);
++            if (error_description) params.set('error_description', error_description);
++            if (proxy.originalState) params.set('state', proxy.originalState);
++
++            res.set({ 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY' });
++            return res.send(renderCustomSchemeRedirect(`${proxy.customUri}?${params}`));
+         }
+-        if (!code) {
+-            res.status(400).json({
+-                error: "invalid_request",
+-                error_description: "Missing authorization code",
++
++        if (error) {
++            logger_1.LOGGER.warn("[MCP-OAUTH] Authorization error from XSUAA", { 
++                error, 
++                errorDescription: error_description 
+             });
+-            return;
++            return res.status(400).json({ error: "authorization_failed", error_description: error_description || error });
+         }
+-        try {
+-            const protocol = getProtocol(req);
+-            const url = redirect_uri || `${protocol}://${req.get("host")}/oauth/callback`;
+-            const tokenData = await xsuaaService.exchangeCodeForToken(code, url, code_verifier);
+-            const scopedToken = await xsuaaService.getApplicationScopes(tokenData);
+-            logger_1.LOGGER.debug("Scopes in token:", scopedToken.scope);
+-            res.json(scopedToken);
+-        }
+-        catch (error) {
+-            logger_1.LOGGER.error("OAuth callback error:", error);
+-            const errorMessage = error instanceof Error ? error.message : "Unknown error";
+-            res.status(400).json({
+-                error: "token_exchange_failed",
+-                error_description: errorMessage,
+-            });
++        if (!code) {
++            logger_1.LOGGER.warn("[MCP-OAUTH] Callback missing authorization code");
++            return res.status(400).json({ error: "invalid_request", error_description: "Missing code" });
+         }
++        
++        logger_1.LOGGER.warn("[MCP-OAUTH] Invalid callback - no proxy state and no custom scheme handling");
++        return res.status(400).json({ error: "invalid_request", error_description: "Invalid callback" });
+     });
+-    // OAuth Token endpoint - POST (standard OAuth 2.0)
++
++    // OAuth Token
+     expressApp.post("/oauth/token", async (req, res) => {
+         await (0, handlers_1.handleTokenRequest)(req, res, xsuaaService);
+     });
+-    // OAuth Discovery endpoint
++
++    // OAuth Authorization Server Metadata
+     expressApp.get("/.well-known/oauth-authorization-server", (req, res) => {
+-        const protocol = getProtocol(req);
+-        const baseUrl = `${protocol}://${req.get("host")}`;
++        const base = `${getProtocol(req)}://${getEffectiveHost(req)}`;
++        const issuer = getSubscriberXsuaaUrl(req, credentials, "");
++
++        logger_1.LOGGER.debug("[MCP-OAUTH] Authorization server metadata requested", {
++            baseUrl: base,
++            issuer
++        });
++
+         res.json({
+-            issuer: credentials.url,
+-            authorization_endpoint: `${baseUrl}/oauth/authorize`,
+-            token_endpoint: `${baseUrl}/oauth/token`,
+-            registration_endpoint: `${baseUrl}/oauth/register`,
++            issuer,
++            authorization_endpoint: `${base}/oauth/authorize`,
++            token_endpoint: `${base}/oauth/token`,
++            registration_endpoint: `${base}/oauth/register`,
+             response_types_supported: ["code"],
+             grant_types_supported: ["authorization_code", "refresh_token"],
+             code_challenge_methods_supported: ["S256"],
+@@ -298,193 +467,87 @@ function registerOAuthEndpoints(expressApp, credentials, kind) {
+             registration_endpoint_auth_methods_supported: ["client_secret_basic"],
+         });
+     });
+-    // OAuth Dynamic Client Registration discovery endpoint (GET)
++
++    // OAuth Client Registration (GET)
+     expressApp.get("/oauth/register", async (req, res) => {
+-        // IAS does not support DCR so we will respond with the pre-configured client_id
+-        if (kind === "ias") {
+-            const protocol = getProtocol(req);
+-            const enhancedResponse = {
+-                client_id: credentials.clientid, // Add our CAP app's client ID
+-                redirect_uris: req.body.redirect_uris || [
+-                    `${protocol}://${req.get("host")}/oauth/callback`,
+-                ],
+-            };
+-            logger_1.LOGGER.debug("Provided static client_id during DCR registration process");
+-            res.json(enhancedResponse);
+-            return;
+-        }
+-        // Keep original implementation for XSUAA
+-        try {
+-            // Simple proxy for discovery - no CSRF needed
+-            const response = await fetch(`${credentials.url}/oauth/register`, {
+-                method: "GET",
+-                headers: {
+-                    Authorization: `Basic ${Buffer.from(`${credentials.clientid}:${credentials.clientsecret}`).toString("base64")}`,
+-                    Accept: "application/json",
+-                },
+-            });
+-            const xsuaaData = await response.json();
+-            // Add missing required fields that MCP client expects
+-            const protocol = getProtocol(req);
+-            const enhancedResponse = {
+-                ...xsuaaData, // Keep all XSUAA fields
+-                client_id: credentials.clientid, // Add our CAP app's client ID
+-                redirect_uris: [`${protocol}://${req.get("host")}/oauth/callback`], // Add our callback URL for discovery
+-            };
+-            res.status(response.status).json(enhancedResponse);
+-        }
+-        catch (error) {
+-            logger_1.LOGGER.error("OAuth registration discovery error:", error);
+-            res.status(500).json({
+-                error: "server_error",
+-                error_description: error instanceof Error ? error.message : "Unknown error",
+-            });
+-        }
++        const callback = `${getProtocol(req)}://${getEffectiveHost(req)}/oauth/callback`;
++        logger_1.LOGGER.debug("[MCP-OAUTH] Client registration discovery requested", { callback });
++        res.json({
++            client_id: credentials.clientid,
++            client_name: "MCP Server",
++            redirect_uris: [callback],
++            token_endpoint_auth_method: "none",
++            grant_types: ["authorization_code", "refresh_token"],
++            response_types: ["code"],
++        });
+     });
+-    // OAuth Dynamic Client Registration endpoint (POST) with CSRF handling
++
++    // OAuth Client Registration (POST)
+     expressApp.post("/oauth/register", async (req, res) => {
+-        // IAS does not support DCR so we will respond with the pre-configured client_id
+-        if (kind === "ias") {
+-            const protocol = getProtocol(req);
+-            const enhancedResponse = {
+-                client_id: credentials.clientid, // Add our CAP app's client ID
+-                redirect_uris: req.body.redirect_uris || [
+-                    `${protocol}://${req.get("host")}/oauth/callback`,
+-                ],
+-            };
+-            logger_1.LOGGER.debug("Provided static client_id during DCR registration process");
+-            res.json(enhancedResponse);
+-            return;
+-        }
+-        // Keep original implementation for XSUAA
+-        try {
+-            // Step 1: Fetch CSRF token from XSUAA
+-            const csrfResponse = await fetch(`${credentials.url}/oauth/register`, {
+-                method: "GET",
+-                headers: {
+-                    "X-CSRF-Token": "Fetch",
+-                    Authorization: `Basic ${Buffer.from(`${credentials.clientid}:${credentials.clientsecret}`).toString("base64")}`,
+-                    Accept: "application/json",
+-                },
+-            });
+-            if (!csrfResponse.ok) {
+-                throw new Error(`CSRF fetch failed: ${csrfResponse.status}`);
+-            }
+-            // Step 2: Extract CSRF token and session cookie
+-            const setCookieHeader = csrfResponse.headers.get("set-cookie") || "";
+-            const csrfToken = extractCsrfFromCookie(setCookieHeader);
+-            if (!csrfToken) {
+-                throw new Error("Could not extract CSRF token from XSUAA response");
+-            }
+-            // Step 3: Make actual registration POST with CSRF token
+-            const registrationResponse = await fetch(`${credentials.url}/oauth/register`, {
+-                method: "POST",
+-                headers: {
+-                    "Content-Type": "application/json",
+-                    "X-CSRF-Token": csrfToken,
+-                    Cookie: setCookieHeader,
+-                    Authorization: `Basic ${Buffer.from(`${credentials.clientid}:${credentials.clientsecret}`).toString("base64")}`,
+-                    Accept: "application/json",
+-                },
+-                body: JSON.stringify(req.body),
+-            });
+-            const xsuaaData = await registrationResponse.json();
+-            // Add missing required fields that MCP client expects
+-            const protocol = getProtocol(req);
+-            const enhancedResponse = {
+-                ...xsuaaData, // Keep all XSUAA fields
+-                client_id: credentials.clientid, // Add our CAP app's client ID
+-                // client_secret: credentials.clientsecret, // CAP app's client secret
+-                redirect_uris: req.body.redirect_uris || [
+-                    `${protocol}://${req.get("host")}/oauth/callback`,
+-                ], // Use client's redirect URIs
+-            };
+-            logger_1.LOGGER.debug("[AUTH] Register POST response", enhancedResponse);
+-            res.status(registrationResponse.status).json(enhancedResponse);
+-        }
+-        catch (error) {
+-            logger_1.LOGGER.error("OAuth registration error:", error);
+-            res.status(500).json({
+-                error: "server_error",
+-                error_description: error instanceof Error ? error.message : "Unknown error",
+-            });
+-        }
++        const callback = `${getProtocol(req)}://${getEffectiveHost(req)}/oauth/callback`;
++        const requestedUris = req.body?.redirect_uris;
++        logger_1.LOGGER.debug("[MCP-OAUTH] Client registration POST received", { 
++            clientName: req.body?.client_name,
++            requestedUris 
++        });
++        res.status(201).json({
++            client_id: credentials.clientid,
++            client_name: req.body?.client_name || "MCP Client",
++            redirect_uris: Array.isArray(requestedUris) && requestedUris.length > 0 ? requestedUris : [callback],
++            token_endpoint_auth_method: "none",
++            grant_types: ["authorization_code", "refresh_token"],
++            response_types: ["code"],
++        });
++    });
++
++    logger_1.LOGGER.info("[MCP-OAUTH] OAuth endpoints registered successfully", {
++        endpoints: [
++            "/.well-known/oauth-protected-resource",
++            "/.well-known/oauth-authorization-server",
++            "/oauth/authorize",
++            "/oauth/callback",
++            "/oauth/token",
++            "/oauth/register"
++        ]
+     });
+-    logger_1.LOGGER.debug("OAuth endpoints registered for XSUAA integration");
+ }
+-/**
+- * Extracts CSRF token from XSUAA Set-Cookie header
+- * Looks for "X-Uaa-Csrf=<token>" pattern in the cookie string
+- */
++
++// ============================================================================
++// CSRF Token Extraction (unused but preserved for compatibility)
++// ============================================================================
++
+ function extractCsrfFromCookie(setCookieHeader) {
+-    if (!setCookieHeader)
+-        return null;
+-    // Match X-Uaa-Csrf=<token> pattern
++    if (!setCookieHeader) return null;
+     const csrfMatch = setCookieHeader.match(/X-Uaa-Csrf=([^;,]+)/i);
+     return csrfMatch ? csrfMatch[1] : null;
+ }
+-/**
+- * Checks whether the requesting user's access matches that of the roles required
+- * @param user
+- * @returns true if the user has access
+- */
++
++// ============================================================================
++// Access Control
++// ============================================================================
++
+ function hasToolOperationAccess(user, roles) {
+-    // If no restrictions are defined, allow access
+-    if (!roles || roles.length === 0)
+-        return true;
+-    for (const el of roles) {
+-        if (user.is(el.role))
+-            return true;
+-    }
+-    return false;
++    if (!roles || roles.length === 0) return true;
++    return roles.some(el => user.is(el.role));
+ }
+-/**
+- * Determines wrap accesses based on the given MCP restrictions derived from annotations
+- * @param user
+- * @param restrictions
+- * @returns wrap tool accesses
+- */
++
+ function getWrapAccesses(user, restrictions) {
+-    // If no restrictions are defined, allow all access
+     if (!restrictions || restrictions.length === 0) {
+-        return {
+-            canRead: true,
+-            canCreate: true,
+-            canUpdate: true,
+-            canDelete: true,
+-        };
++        return { canRead: true, canCreate: true, canUpdate: true, canDelete: true };
+     }
++
+     const access = {};
+     for (const el of restrictions) {
+-        // If the user does not even have the role then no reason to check
+-        if (!user.is(el.role))
+-            continue;
++        if (!user.is(el.role)) continue;
++
+         if (!el.operations || el.operations.length <= 0) {
+-            access.canRead = true;
+-            access.canCreate = true;
+-            access.canDelete = true;
+-            access.canUpdate = true;
+-            break;
+-        }
+-        if (el.operations.includes("READ")) {
+-            access.canRead = true;
+-        }
+-        if (el.operations.includes("UPDATE")) {
+-            access.canUpdate = true;
+-        }
+-        if (el.operations.includes("CREATE")) {
+-            access.canCreate = true;
+-        }
+-        if (el.operations.includes("DELETE")) {
+-            access.canDelete = true;
++            return { canRead: true, canCreate: true, canUpdate: true, canDelete: true };
+         }
++
++        if (el.operations.includes("READ")) access.canRead = true;
++        if (el.operations.includes("UPDATE")) access.canUpdate = true;
++        if (el.operations.includes("CREATE")) access.canCreate = true;
++        if (el.operations.includes("DELETE")) access.canDelete = true;
+     }
+     return access;
+ }
+-/**
+- * Utility method for checking whether auth used is mocked and not live
+- * @returns boolean
+- */
+-function useMockAuth(authKind) {
+-    return authKind !== "jwt" && authKind !== "ias" && authKind !== "xsuaa";
+-}
+diff --git a/node_modules/@gavdi/cap-mcp/lib/auth/xsuaa-service.js b/node_modules/@gavdi/cap-mcp/lib/auth/xsuaa-service.js
+index 042399f..b5272a0 100644
+--- a/node_modules/@gavdi/cap-mcp/lib/auth/xsuaa-service.js
++++ b/node_modules/@gavdi/cap-mcp/lib/auth/xsuaa-service.js
+@@ -252,19 +252,18 @@ class XSUAAService {
+         try {
+             const authHeader = req.headers.authorization;
+             if (!authHeader || !authHeader.startsWith("Bearer ")) {
++                logger_1.LOGGER.debug("[XSUAA] No Bearer token in Authorization header");
+                 return null;
+             }
+             const token = authHeader.substring(7);
+             const securityContext = await xssec.createSecurityContext(this.xsuaaService, { req, token: token });
++            logger_1.LOGGER.debug("[XSUAA] Security context created successfully");
+             return securityContext;
+         }
+         catch (error) {
+-            if (error instanceof xssec.errors.TokenValidationError) {
+-                logger_1.LOGGER.warn("Security context creation failed:", error.message);
+-            }
+-            else if (error instanceof Error) {
+-                logger_1.LOGGER.warn("Security context creation failed:", error.message);
+-            }
++            logger_1.LOGGER.error("[XSUAA] Security context creation failed", {
++                error: error?.message
++            });
+             return null;
+         }
+     }
+diff --git a/node_modules/@gavdi/cap-mcp/lib/mcp/entity-tools.js b/node_modules/@gavdi/cap-mcp/lib/mcp/entity-tools.js
+index 9576a8b..9e67623 100644
+--- a/node_modules/@gavdi/cap-mcp/lib/mcp/entity-tools.js
++++ b/node_modules/@gavdi/cap-mcp/lib/mcp/entity-tools.js
+@@ -124,7 +124,11 @@ function registerEntityWrappers(resAnno, server, authEnabled, defaultModes, acce
+  * We prefer a descriptive naming scheme that is easy for humans and LLMs:
+  *   Service_Entity_mode
+  */
+-function nameFor(service, entity, suffix) {
++function nameFor(service, entity, suffix, customName) {
++    // Custom name takes priority - uses format: customName_suffix
++    if (customName) {
++        return `${customName}_${suffix}`;
++    }
+     // Use explicit Service_Entity_suffix naming to match docs/tests
+     const entityName = entity.split(".").pop(); // keep original case
+     const serviceName = service.split(".").pop(); // keep original case
+@@ -135,7 +139,7 @@ function nameFor(service, entity, suffix) {
+  * Supports select/where/orderby/top/skip and simple text search (q).
+  */
+ function registerQueryTool(resAnno, server, authEnabled) {
+-    const toolName = nameFor(resAnno.serviceName, resAnno.target, "query");
++    const toolName = nameFor(resAnno.serviceName, resAnno.target, "query", resAnno.wrap?.name);
+     // Structured input schema for queries with guard for empty property lists
+     const allKeys = Array.from(resAnno.properties.keys());
+     const scalarKeys = Array.from(resAnno.properties.entries())
+@@ -275,7 +279,7 @@ function registerQueryTool(resAnno, server, authEnabled) {
+  * Accepts keys either as an object or shorthand (single-key) value.
+  */
+ function registerGetTool(resAnno, server, authEnabled) {
+-    const toolName = nameFor(resAnno.serviceName, resAnno.target, "get");
++    const toolName = nameFor(resAnno.serviceName, resAnno.target, "get", resAnno.wrap?.name);
+     const inputSchema = {};
+     for (const [k, cdsType] of resAnno.resourceKeys.entries()) {
+         inputSchema[k] = (0, utils_2.determineMcpParameterType)(cdsType).describe(`Key ${k}. ${resAnno.propertyHints.get(k) ?? ""}`);
+@@ -348,7 +352,7 @@ function registerGetTool(resAnno, server, authEnabled) {
+  * Associations are exposed via <assoc>_ID fields for simplicity.
+  */
+ function registerCreateTool(resAnno, server, authEnabled) {
+-    const toolName = nameFor(resAnno.serviceName, resAnno.target, "create");
++    const toolName = nameFor(resAnno.serviceName, resAnno.target, "create", resAnno.wrap?.name);
+     const inputSchema = {};
+     for (const [propName, cdsType] of resAnno.properties.entries()) {
+         const isAssociation = String(cdsType).toLowerCase().includes("association");
+@@ -447,7 +451,7 @@ function registerCreateTool(resAnno, server, authEnabled) {
+  * Keys are required; non-key fields are optional. Associations via <assoc>_ID.
+  */
+ function registerUpdateTool(resAnno, server, authEnabled) {
+-    const toolName = nameFor(resAnno.serviceName, resAnno.target, "update");
++    const toolName = nameFor(resAnno.serviceName, resAnno.target, "update", resAnno.wrap?.name);
+     const inputSchema = {};
+     // Keys required
+     for (const [k, cdsType] of resAnno.resourceKeys.entries()) {
+@@ -569,7 +573,7 @@ function registerUpdateTool(resAnno, server, authEnabled) {
+  * Requires keys to identify the entity to delete.
+  */
+ function registerDeleteTool(resAnno, server, authEnabled) {
+-    const toolName = nameFor(resAnno.serviceName, resAnno.target, "delete");
++    const toolName = nameFor(resAnno.serviceName, resAnno.target, "delete", resAnno.wrap?.name);
+     const inputSchema = {};
+     // Keys required for deletion
+     for (const [k, cdsType] of resAnno.resourceKeys.entries()) {
